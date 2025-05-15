@@ -81,7 +81,7 @@ func Server(s *etcdserver.EtcdServer, tls *tls.Config, interceptor grpc.UnarySer
 	grpcServer := grpc.NewServer(append(opts, gopts...)...)
 
 	pb.RegisterKVServer(grpcServer, NewQuotaKVServer(s))
-	pb.RegisterWatchServer(grpcServer, NewWatchServer(s))
+	pb.RegisterWatchServer(grpcServer, NewWatchServer(s)) // 这里是rpc方法响应类对象实例
 	pb.RegisterLeaseServer(grpcServer, NewQuotaLeaseServer(s))
 	pb.RegisterClusterServer(grpcServer, NewClusterServer(s))
 	pb.RegisterAuthServer(grpcServer, NewAuthServer(s))

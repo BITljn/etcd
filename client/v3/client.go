@@ -48,10 +48,10 @@ var (
 
 // Client provides and manages an etcd v3 client session.
 type Client struct {
-	Cluster
+	Cluster // 接口 embedding, 直接赋值初始化一个 Cluster接口对象，然后 Client实例直接可以调用接口 Cluster的方法
 	KV
 	Lease
-	Watcher
+	Watcher // 重点关注这个方法：Watch(ctx context.Context, key string, opts ...OpOption) WatchChan
 	Auth
 	Maintenance
 
@@ -461,6 +461,7 @@ func newClient(cfg *Config) (*Client, error) {
 
 	// Use a provided endpoint target so that for https:// without any tls config given, then
 	// grpc will assume the certificate server name is the endpoint host.
+	// grpc 连接这里建立
 	conn, err := client.dialWithBalancer()
 	if err != nil {
 		client.cancel()
@@ -473,7 +474,7 @@ func newClient(cfg *Config) (*Client, error) {
 	client.Cluster = NewCluster(client)
 	client.KV = NewKV(client)
 	client.Lease = NewLease(client)
-	client.Watcher = NewWatcher(client)
+	client.Watcher = NewWatcher(client) // 这里建立 watcher， client.conn 是我们的grpc连接
 	client.Auth = NewAuth(client)
 	client.Maintenance = NewMaintenance(client)
 

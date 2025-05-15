@@ -132,9 +132,9 @@ type serverWatchStream struct {
 	watchable mvcc.WatchableKV
 	ag        AuthGetter
 
-	gRPCStream  pb.Watch_WatchServer
-	watchStream mvcc.WatchStream
-	ctrlStream  chan *pb.WatchResponse
+	gRPCStream  pb.Watch_WatchServer   // 对应的 grpc stream
+	watchStream mvcc.WatchStream       // 这个东西需要修改为自己的，来自 etcd收包
+	ctrlStream  chan *pb.WatchResponse // 发送控制数据的 chan
 
 	// mu protects progress, prevKV, fragment
 	mu sync.RWMutex
@@ -153,6 +153,7 @@ type serverWatchStream struct {
 	wg sync.WaitGroup
 }
 
+// 一个 Watch 管理的是 client的一个 watchGRPCStream, 其包含多个 substream， 这里就是处理 GRPC的所有事件
 func (ws *watchServer) Watch(stream pb.Watch_WatchServer) (err error) {
 	sws := serverWatchStream{
 		lg: ws.lg,
@@ -178,9 +179,9 @@ func (ws *watchServer) Watch(stream pb.Watch_WatchServer) (err error) {
 		closec: make(chan struct{}),
 	}
 
-	sws.wg.Add(1)
+	sws.wg.Add(1) // 这里 grcp stream 就一个Add
 	go func() {
-		sws.sendLoop()
+		sws.sendLoop() // 负责把事件和控制响应发回 client
 		sws.wg.Done()
 	}()
 
@@ -190,6 +191,7 @@ func (ws *watchServer) Watch(stream pb.Watch_WatchServer) (err error) {
 	// may continue to block since it uses a different context, leading to
 	// deadlock when calling sws.close().
 	go func() {
+		// 负责从 client 读取 watch 请求（创建、取消、进度）
 		if rerr := sws.recvLoop(); rerr != nil {
 			if isClientCtxErr(stream.Context().Err(), rerr) {
 				sws.lg.Debug("failed to receive watch request from gRPC stream", zap.Error(rerr))
@@ -241,7 +243,7 @@ func (sws *serverWatchStream) isWatchPermitted(wcr *pb.WatchCreateRequest) error
 
 func (sws *serverWatchStream) recvLoop() error {
 	for {
-		req, err := sws.gRPCStream.Recv()
+		req, err := sws.gRPCStream.Recv() // 收 client 控制请求
 		if errors.Is(err, io.EOF) {
 			return nil
 		}
@@ -287,6 +289,7 @@ func (sws *serverWatchStream) recvLoop() error {
 					cancelReason = rpctypes.ErrGRPCPermissionDenied.Error()
 				}
 
+				// 这里是要取消，因为权限不允许
 				wr := &pb.WatchResponse{
 					Header:       sws.newResponseHeader(sws.watchStream.Rev()),
 					WatchId:      clientv3.InvalidWatchID,
@@ -305,11 +308,14 @@ func (sws *serverWatchStream) recvLoop() error {
 
 			filters := FiltersFromRequest(creq)
 
+			// 这里是rev,不是 recv
 			wsrev := sws.watchStream.Rev()
 			rev := creq.StartRevision
 			if rev == 0 {
 				rev = wsrev + 1
 			}
+
+			// 这里有生成的 watch-id
 			id, err := sws.watchStream.Watch(mvcc.WatchID(creq.WatchId), creq.Key, creq.RangeEnd, rev, filters...)
 			if err == nil {
 				sws.mu.Lock()
@@ -336,6 +342,8 @@ func (sws *serverWatchStream) recvLoop() error {
 			if err != nil {
 				wr.CancelReason = err.Error()
 			}
+
+			// 这个发送到控制信道，在 sendLoop会发送给 etcd-client
 			select {
 			case sws.ctrlStream <- wr:
 			case <-sws.closec:
@@ -416,11 +424,12 @@ func (sws *serverWatchStream) sendLoop() {
 			evs := wresp.Events
 			events := make([]*mvccpb.Event, len(evs))
 			sws.mu.RLock()
-			needPrevKV := sws.prevKV[wresp.WatchID]
+			needPrevKV := sws.prevKV[wresp.WatchID] //判断是否返回以前的 key
 			sws.mu.RUnlock()
 			for i := range evs {
 				events[i] = &evs[i]
 				if needPrevKV && !IsCreateEvent(evs[i]) {
+					// 获取上一次的 keyValue
 					opt := mvcc.RangeOptions{Rev: evs[i].Kv.ModRevision - 1}
 					r, err := sws.watchable.Range(context.TODO(), evs[i].Kv.Key, nil, opt)
 					if err == nil && len(r.KVs) != 0 {
@@ -458,7 +467,7 @@ func (sws *serverWatchStream) sendLoop() {
 			var serr error
 			// gofail: var beforeSendWatchResponse struct{}
 			if !fragmented && !ok {
-				serr = sws.gRPCStream.Send(wr)
+				serr = sws.gRPCStream.Send(wr) // 通过流把数据发送会 etcd-client
 			} else {
 				serr = sendFragments(wr, sws.maxRequestBytes, sws.gRPCStream.Send)
 			}

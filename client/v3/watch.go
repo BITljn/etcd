@@ -88,6 +88,7 @@ type Watcher interface {
 	Close() error
 }
 
+// 这里定义了 RPC接口的返回方式，grpc 本身支持流式连接，可以屏蔽很多连接细节和 retry逻辑
 type WatchResponse struct {
 	Header pb.ResponseHeader
 	Events []*Event
@@ -126,7 +127,7 @@ func (wr *WatchResponse) Err() error {
 		return v3rpc.Error(wr.closeErr)
 	case wr.CompactRevision != 0:
 		return v3rpc.ErrCompacted
-	case wr.Canceled:
+	case wr.Canceled: // server 取消就是这里出错
 		if len(wr.cancelReason) != 0 {
 			return v3rpc.Error(status.Error(codes.FailedPrecondition, wr.cancelReason))
 		}
@@ -156,7 +157,7 @@ type watcher struct {
 // watchGRPCStream tracks all watch resources attached to a single grpc stream.
 type watchGRPCStream struct {
 	owner    *watcher
-	remote   pb.WatchClient
+	remote   pb.WatchClient // 这个 client共享给了多个 watchGRPCStream，因此他们最终的 rpc调用就共用了一个 tcp连接了。
 	callOpts []grpc.CallOption
 
 	// ctx controls internal remote.Watch requests
@@ -171,9 +172,11 @@ type watchGRPCStream struct {
 	resuming []*watcherStream
 
 	// reqc sends a watch request from Watch() to the main goroutine
-	reqc chan watchStreamRequest
+	reqc chan watchStreamRequest // 主线程发送watch请求用的
+
 	// respc receives data from the watch client
-	respc chan *pb.WatchResponse
+	respc chan *pb.WatchResponse // 从 rpc server 收到报文
+
 	// donec closes to broadcast shutdown
 	donec chan struct{}
 	// errc transmits errors from grpc Recv to the watch stream reconnect logic
@@ -231,6 +234,7 @@ type watcherStream struct {
 	// outc publishes watch responses to subscriber
 	outc chan WatchResponse
 	// recvc buffers watch responses before publishing
+	// dispatchEvent() 会给这里发送数据，通过 unicast 或者broadcast
 	recvc chan *WatchResponse
 	// donec closes when the watcherStream goroutine stops.
 	donec chan struct{}
@@ -240,17 +244,19 @@ type watcherStream struct {
 	id int64
 
 	// buf holds all events received from etcd but not yet consumed by the client
+	// 这里就是缓存吧
 	buf []*WatchResponse
 }
 
+// 一个 etcd client 会初始化一个 watcher，同一个 watcher的多个 Watch 监听 prefix过程复用了同一个 grpc stream
 func NewWatcher(c *Client) Watcher {
 	return NewWatchFromWatchClient(pb.NewWatchClient(c.conn), c)
 }
 
 func NewWatchFromWatchClient(wc pb.WatchClient, c *Client) Watcher {
 	w := &watcher{
-		remote:  wc,
-		streams: make(map[string]*watchGRPCStream),
+		remote:  wc,                                // 这个 wc 里面保存外部传过的唯一 grpc 连接
+		streams: make(map[string]*watchGRPCStream), // 这里的 streams 是一个 map，key 是 ctx 的值，不是具体我们需要的 domain区别下，就是说一个 domain，可以通过watch多次，因为版本好可以不同，这是区别。
 	}
 	if c != nil {
 		w.callOpts = c.callOpts
@@ -272,6 +278,7 @@ func (vc *valCtx) Deadline() (time.Time, bool) { return zeroTime, false }
 func (vc *valCtx) Done() <-chan struct{}       { return valCtxCh }
 func (vc *valCtx) Err() error                  { return nil }
 
+// Watch 方法会根据ctx, 初始化一个wgs 结构体
 func (w *watcher) newWatcherGRPCStream(inctx context.Context) *watchGRPCStream {
 	ctx, cancel := context.WithCancel(&valCtx{inctx})
 	wgs := &watchGRPCStream{
@@ -280,7 +287,7 @@ func (w *watcher) newWatcherGRPCStream(inctx context.Context) *watchGRPCStream {
 		callOpts:   w.callOpts,
 		ctx:        ctx,
 		ctxKey:     streamKeyFromCtx(inctx),
-		cancel:     cancel,
+		cancel:     cancel, //wgs关闭会调用这个 cancal()
 		substreams: make(map[int64]*watcherStream),
 		respc:      make(chan *pb.WatchResponse),
 		reqc:       make(chan watchStreamRequest),
@@ -290,6 +297,7 @@ func (w *watcher) newWatcherGRPCStream(inctx context.Context) *watchGRPCStream {
 		resumec:    make(chan struct{}),
 		lg:         w.lg,
 	}
+	// 每个 wgs 对应一个逻辑管理线程，一个ctx对应一个
 	go wgs.run()
 	return wgs
 }
@@ -316,12 +324,14 @@ func (w *watcher) Watch(ctx context.Context, key string, opts ...OpOption) Watch
 		fragment:       ow.fragment,
 		filters:        filters,
 		prevKV:         ow.prevKV,
-		retc:           make(chan chan WatchResponse, 1),
+		retc:           make(chan chan WatchResponse, 1), // 需要看下这个东西哪里返回，一个接受 chan 的 chan
 	}
 
 	ok := false
 	ctxKey := streamKeyFromCtx(ctx)
 
+	// closeCh is a channel for receiving watch responses when the watcher is closed.
+	// When nil, indicates the watcher is still active.
 	var closeCh chan WatchResponse
 	for {
 		// find or allocate appropriate grpc watch stream
@@ -335,11 +345,12 @@ func (w *watcher) Watch(ctx context.Context, key string, opts ...OpOption) Watch
 		}
 		wgs := w.streams[ctxKey]
 		if wgs == nil {
-			wgs = w.newWatcherGRPCStream(ctx)
+			wgs = w.newWatcherGRPCStream(ctx) // wgs.run() 启动了收包流程
 			w.streams[ctxKey] = wgs
 		}
+
 		donec := wgs.donec
-		reqc := wgs.reqc
+		reqc := wgs.reqc // 这是一个请求，在 grpc 中逻辑上的子流
 		w.mu.Unlock()
 
 		// couldn't create channel; return closed channel
@@ -349,9 +360,9 @@ func (w *watcher) Watch(ctx context.Context, key string, opts ...OpOption) Watch
 
 		// submit request
 		select {
-		case reqc <- wr:
+		case reqc <- wr: // 要发送一个watch请求，对应具体的某个 ctx下的 substream
 			ok = true
-		case <-wr.ctx.Done():
+		case <-wr.ctx.Done(): //父context手动取消，或者超时了。
 			ok = false
 		case <-donec:
 			ok = false
@@ -366,10 +377,11 @@ func (w *watcher) Watch(ctx context.Context, key string, opts ...OpOption) Watch
 		// receive channel
 		if ok {
 			select {
-			case ret := <-wr.retc:
+			case ret := <-wr.retc: // 这地方是 watchRequest,里面返回一个chan用来给调用着收数据，也即为 Watch()函数返回值
 				return ret
 			case <-ctx.Done():
 			case <-donec:
+				// 连接断开或者关闭了，如果有错误，错误信息返回到 closeCh
 				if wgs.closeErr != nil {
 					closeCh <- WatchResponse{Canceled: true, closeErr: wgs.closeErr}
 					break
@@ -385,6 +397,7 @@ func (w *watcher) Watch(ctx context.Context, key string, opts ...OpOption) Watch
 	return closeCh
 }
 
+// 这个 Watcher是共享的一个 remote connection
 func (w *watcher) Close() (err error) {
 	w.mu.Lock()
 	streams := w.streams
@@ -477,13 +490,15 @@ func (w *watchGRPCStream) sendCloseSubstream(ws *watcherStream, resp *WatchRespo
 	close(ws.outc)
 }
 
+// 给上层发挥一个错误的 resp
+// 释放结构体资源，变更 map
 func (w *watchGRPCStream) closeSubstream(ws *watcherStream) {
 	// send channel response in case stream was never established
 	select {
 	case ws.initReq.retc <- ws.outc:
 	default:
 	}
-	// close subscriber's channel
+	// close subscriber's channel， 这是给外部的调用发送一个关闭的 resp
 	if closeErr := w.closeErr; closeErr != nil && ws.initReq.ctx.Err() == nil {
 		go w.sendCloseSubstream(ws, &WatchResponse{Canceled: true, closeErr: w.closeErr})
 	} else if ws.outc != nil {
@@ -510,13 +525,14 @@ func (w *watchGRPCStream) run() {
 	// avoiding double-closing recvc on grpc stream teardown
 	closing := make(map[*watcherStream]struct{})
 
+	// 这里如果异常退出就走清理资源逻辑，会关闭返回给用户的 chan
 	defer func() {
 		w.closeErr = closeErr
 		// shutdown substreams and resuming substreams
 		for _, ws := range w.substreams {
-			if _, ok := closing[ws]; !ok {
-				close(ws.recvc)
-				closing[ws] = struct{}{}
+			if _, ok := closing[ws]; !ok { // 这里修改状态，不是在 closing, 去 close(ws.recvc)关闭 serveSubstream线程
+				close(ws.recvc)          // 先关闭内部接受，wgs 不能继续发数据到这里
+				closing[ws] = struct{}{} // 标记关闭
 			}
 		}
 		for _, ws := range w.resuming {
@@ -525,15 +541,21 @@ func (w *watchGRPCStream) run() {
 				closing[ws] = struct{}{}
 			}
 		}
-		w.joinSubstreams()
+		w.joinSubstreams() // 等待substream 退出，done
 		for range closing {
-			w.closeSubstream(<-w.closingc)
+			w.closeSubstream(<-w.closingc) // 给用户发送一个错误的 resp，清理最后的数组等逻辑数据
 		}
 		w.wg.Wait()
-		w.owner.closeStream(w)
+		w.owner.closeStream(w) // 在 watcher释放
 	}()
 
 	// start a stream with the etcd grpc server
+	// 核心调用：
+	// 1. joinSubstreams，通过close(w.resumec)
+	// 2. openWatchClient
+	// 3. serveWatchClient
+	// 4. serveSubstream
+	// 一个 wc个一个wgs一一对应 etcdclient在这上边维护多个逻辑 substream
 	if wc, closeErr = w.newWatchClient(); closeErr != nil {
 		return
 	}
@@ -560,10 +582,14 @@ func (w *watchGRPCStream) run() {
 
 				ws.donec = make(chan struct{})
 				w.wg.Add(1)
+				// 服务订阅对象的每个 ws 有一个单独的 goroutine（这个就对应一个 key监听这么理解）
 				go w.serveSubstream(ws, w.resumec)
 
 				// queue up for watcher creation/resume
 				w.resuming = append(w.resuming, ws)
+				// 这里是这个ctx下唯一的一个 watcherStream，也是第一个 watch req
+				// 正常情况就一个 resuming，这是初次请求发生, 如果是多个 resuming,那么会在收到第一个的创建结果后
+				// 在去发送创建请求
 				if len(w.resuming) == 1 {
 					// head of resume queue, can register a new watcher
 					if err := wc.Send(ws.initReq.toPB()); err != nil {
@@ -577,6 +603,7 @@ func (w *watchGRPCStream) run() {
 			}
 
 		// new events from the watch client
+		// 所有 substream 的包都是这里接受的。所以这地方定义了发送和接收双方的协议
 		case pbresp := <-w.respc:
 			if cur == nil || pbresp.Created || pbresp.Canceled {
 				cur = pbresp
@@ -590,14 +617,16 @@ func (w *watchGRPCStream) run() {
 			switch {
 			case pbresp.Created:
 				// response to head of queue creation
+				// resuming 是严格按照顺序的，是个队列先进先出
 				if len(w.resuming) != 0 {
 					if ws := w.resuming[0]; ws != nil {
-						w.addSubstream(pbresp, ws)
-						w.dispatchEvent(pbresp)
+						w.addSubstream(pbresp, ws) // 添加到substream 数组中，会有一个唯一的 watchId
+						w.dispatchEvent(pbresp)    // 这是第一个 watch response直接也返回给用户了。
 						w.resuming[0] = nil
 					}
 				}
-
+				// resuming 数组的第一个，这个地方发送初始化 watch 请求
+				// 这里也是恢复后续其他 watch stream 逻辑，异常的情况那里只发送了一个 req, 这个 ws恢复了，在恢复其他的
 				if ws := w.nextResume(); ws != nil {
 					if err := wc.Send(ws.initReq.toPB()); err != nil {
 						w.lg.Debug("error when sending request", zap.Error(err))
@@ -607,17 +636,19 @@ func (w *watchGRPCStream) run() {
 				// reset for next iteration
 				cur = nil
 
+			//  server端通知取消的逻辑, 取消对应的 substream， serveSubStream 线程会退出去
 			case pbresp.Canceled && pbresp.CompactRevision == 0:
 				delete(cancelSet, pbresp.WatchId)
 				if ws, ok := w.substreams[pbresp.WatchId]; ok {
-					// signal to stream goroutine to update closingc
+					// signal to stream goroutine to update closingc， 注意这里！！！
 					close(ws.recvc)
-					closing[ws] = struct{}{}
+					closing[ws] = struct{}{} // 先给标记为关闭中
 				}
 
 				// reset for next iteration
 				cur = nil
 
+			// 分片逻辑
 			case cur.Fragment:
 				// watch response events are still fragmented
 				// continue to fetch next fragmented event arrival
@@ -625,14 +656,17 @@ func (w *watchGRPCStream) run() {
 
 			default:
 				// dispatch to appropriate watch stream
+				// 这里是收到 etcd server 的 watch response 了
 				ok := w.dispatchEvent(cur)
 
 				// reset for next iteration
 				cur = nil
 
+				// ok 说明找到了 substream watchid
 				if ok {
 					break
 				}
+				// ok=false 说明收到的包不对劲，需要取消
 
 				// watch response on unexpected watch id; cancel id
 				if _, ok := cancelSet[pbresp.WatchId]; ok {
@@ -653,15 +687,23 @@ func (w *watchGRPCStream) run() {
 			}
 
 		// watch client failed on Recv; spawn another if possible
+		// 某一个 wc.recv (w.remote.Recv() 返回的结构为 wc， 不同的substream 不一样对象) 出错了，处理重连的场景，并且有退让时间
 		case err := <-w.errc:
+			// 这些场景直接关闭了
 			if isHaltErr(w.ctx, err) || errors.Is(ContextError(w.ctx, err), v3rpc.ErrNoLeader) {
 				closeErr = err
 				return
 			}
+			// 这里是 grpc stream 断开了，重新连接
 			backoff = w.backoffIfUnavailable(backoff, err)
+			// 这个 newWatchClient 全文一共就两个地方使用
+			// 1. 这里出错重连，这里重连是要连接所有的 substream，因此 newWatchClient 会需要去join这些连接
+			// 2. run() 的开头
+			// 这地方相当于从新调用了一次 rpc接口，也就是重连了。这么理解吧, 这个 wc是新的
 			if wc, closeErr = w.newWatchClient(); closeErr != nil {
-				return
+				return // 直接 return会走到 defer中，彻底关闭 wgs
 			}
+			// 注意这里是按照顺序一个一个 resume,避免 server压力过大
 			if ws := w.nextResume(); ws != nil {
 				if err := wc.Send(ws.initReq.toPB()); err != nil {
 					w.lg.Debug("error when sending request", zap.Error(err))
@@ -669,23 +711,26 @@ func (w *watchGRPCStream) run() {
 			}
 			cancelSet = make(map[int64]struct{})
 
+		// cancel场景，例如我们取消订阅
 		case <-w.ctx.Done():
 			return
 
-		case ws := <-w.closingc:
+		// 关闭其中一个 substream 场景
+		case ws := <-w.closingc: // 收到的是一个 WatcherStream结构体, 收到之前会先标记到 closing数组中
 			w.closeSubstream(ws)
-			delete(closing, ws)
+			delete(closing, ws) // 去除标记，标识删除完了，那么后面会给 server发送取消，可能不一定成功，但是其他地方有容错
 			// no more watchers on this stream, shutdown, skip cancellation
 			if len(w.substreams)+len(w.resuming) == 0 {
 				return
 			}
+			// 给 server发送取消信号
 			if ws.id != InvalidWatchID {
 				// client is closing an established watch; close it on the server proactively instead of waiting
 				// to close when the next message arrives
 				cancelSet[ws.id] = struct{}{}
 				cr := &pb.WatchRequest_CancelRequest{
 					CancelRequest: &pb.WatchCancelRequest{
-						WatchId: ws.id,
+						WatchId: ws.id, // 这里就是关闭其中的一个 substream（不影响 wgs）, 连接还在
 					},
 				}
 				req := &pb.WatchRequest{RequestUnion: cr}
@@ -763,16 +808,17 @@ func (w *watchGRPCStream) unicastResponse(wr *WatchResponse, watchID int64) bool
 // serveWatchClient forwards messages from the grpc stream to run()
 func (w *watchGRPCStream) serveWatchClient(wc pb.Watch_WatchClient) {
 	for {
-		resp, err := wc.Recv()
+		resp, err := wc.Recv() // 每个 wc 是都一个独立的 grpc stream
 		if err != nil {
 			select {
-			case w.errc <- err:
+			case w.errc <- err: // 这里是异常，wgs.run 会处理异常并重连
 			case <-w.donec:
 			}
 			return
 		}
+		// 正常读取数据从 stream 中
 		select {
-		case w.respc <- resp:
+		case w.respc <- resp: // 这里是从 grpc stream 读取数据，然后放到 w.respc 中, 这个 resp channel 是包含所有的 substream的包
 		case <-w.donec:
 			return
 		}
@@ -794,7 +840,7 @@ func (w *watchGRPCStream) serveSubstream(ws *watcherStream, resumec chan struct{
 		}
 		close(ws.donec)
 		if !resuming {
-			w.closingc <- ws
+			w.closingc <- ws // 这个会传递给 wgs.run 处理, 主要是给 server 发送取消
 		}
 		w.wg.Done()
 	}()
@@ -804,19 +850,23 @@ func (w *watchGRPCStream) serveSubstream(ws *watcherStream, resumec chan struct{
 		curWr := emptyWr
 		outc := ws.outc
 
+		// curWr 指向 buf的第一个元素，如果不为空，那么 outc 就是 ws(watcherStream) 的 outc
+		// 这样子在第一个 case中就被发送出去了，然后 buf[0] 就被置为 nil
 		if len(ws.buf) > 0 {
 			curWr = ws.buf[0]
 		} else {
 			outc = nil
 		}
+
 		select {
-		case outc <- *curWr:
+		case outc <- *curWr: // 这里 outc=nil 的时候，不会被写入到 channel
 			if ws.buf[0].Err() != nil {
 				return
 			}
 			ws.buf[0] = nil
 			ws.buf = ws.buf[1:]
-		case wr, ok := <-ws.recvc:
+		case wr, ok := <-ws.recvc: // 这个 channel 关闭就是 ok = false
+			// 从 server 端读到的 watch response，并缓存到buf中去
 			if !ok {
 				// shutdown from closeSubstream
 				return
@@ -824,6 +874,7 @@ func (w *watchGRPCStream) serveSubstream(ws *watcherStream, resumec chan struct{
 
 			if wr.Created {
 				if ws.initReq.retc != nil {
+					// 返回是 chan 嵌套，这里保证给 app返回唯一的 chan
 					ws.initReq.retc <- ws.outc
 					// to prevent next write from taking the slot in buffered channel
 					// and posting duplicate create events
@@ -869,7 +920,7 @@ func (w *watchGRPCStream) serveSubstream(ws *watcherStream, resumec chan struct{
 			return
 		case <-ws.initReq.ctx.Done():
 			return
-		case <-resumec:
+		case <-resumec: // 收到 resume 信号，例如新的 grpc stream 建立成功，外部会 close resumec
 			resuming = true
 			return
 		}
@@ -879,9 +930,12 @@ func (w *watchGRPCStream) serveSubstream(ws *watcherStream, resumec chan struct{
 
 func (w *watchGRPCStream) newWatchClient() (pb.Watch_WatchClient, error) {
 	// mark all substreams as resuming
+	// 这地方是主动让所有 substream 关闭，然后 join
 	close(w.resumec)
 	w.resumec = make(chan struct{})
 	w.joinSubstreams()
+
+	// join后把所有的 stream全部假如到 resuming数组中用于恢复。
 	for _, ws := range w.substreams {
 		ws.id = InvalidWatchID
 		w.resuming = append(w.resuming, ws)
@@ -898,19 +952,23 @@ func (w *watchGRPCStream) newWatchClient() (pb.Watch_WatchClient, error) {
 
 	// connect to grpc stream while accepting watcher cancelation
 	stopc := make(chan struct{})
+	// 处理取消逻辑
 	donec := w.waitCancelSubstreams(stopc)
-	wc, err := w.openWatchClient()
+	wc, err := w.openWatchClient() // pb.Watch_WatchClient 返回，grpc定义的结构
 	close(stopc)
 	<-donec
 
 	// serve all non-closing streams, even if there's a client error
 	// so that the teardown path can shutdown the streams as expected.
+	// 前边已经把stream 加入到了 resuming 中，关闭的除外，关闭的在 waitCancelSubstreams 中会设置 closing=true
 	for _, ws := range w.resuming {
 		if ws.closing {
 			continue
 		}
 		ws.donec = make(chan struct{})
 		w.wg.Add(1)
+		// 处理从 server 端读取数据，然后缓存，再从缓存中把数据吐给 ws.outc
+		// 这个 resumec 是一个 channel，外部会 close 这个 channel, 让所有的 channel 重连接
 		go w.serveSubstream(ws, w.resumec)
 	}
 
@@ -919,10 +977,13 @@ func (w *watchGRPCStream) newWatchClient() (pb.Watch_WatchClient, error) {
 	}
 
 	// receive data from new grpc stream
+	// 一个 ctx对应一个全局的，读取数据后，写入到了 wgs.respc中
 	go w.serveWatchClient(wc)
 	return wc, nil
 }
 
+// 就只有连接重连过程会被触发，wgs中的一个 substream异常了就会触发整个 wgs所有的stream重连。
+// 这里就是处理关闭 watcherStream 的逻辑 或者 取消 ctx等场景，如果没有那么外部会 close(stopc)
 func (w *watchGRPCStream) waitCancelSubstreams(stopc <-chan struct{}) <-chan struct{} {
 	var wg sync.WaitGroup
 	wg.Add(len(w.resuming))
@@ -930,7 +991,8 @@ func (w *watchGRPCStream) waitCancelSubstreams(stopc <-chan struct{}) <-chan str
 	for i := range w.resuming {
 		go func(ws *watcherStream) {
 			defer wg.Done()
-			if ws.closing {
+			if ws.closing { // watherStream 退出不是由于resume关闭，那么会进入这里， server触发关闭
+				// ctx.Err watch ctx 取消了，或者 watch返回了报错
 				if ws.initReq.ctx.Err() != nil && ws.outc != nil {
 					close(ws.outc)
 					ws.outc = nil
@@ -938,7 +1000,7 @@ func (w *watchGRPCStream) waitCancelSubstreams(stopc <-chan struct{}) <-chan str
 				return
 			}
 			select {
-			case <-ws.initReq.ctx.Done():
+			case <-ws.initReq.ctx.Done(): // 用户调用了 cancel 或者 watcher.Close 操作
 				// closed ws will be removed from resuming
 				ws.closing = true
 				close(ws.outc)
@@ -946,7 +1008,7 @@ func (w *watchGRPCStream) waitCancelSubstreams(stopc <-chan struct{}) <-chan str
 				w.wg.Add(1)
 				go func() {
 					defer w.wg.Done()
-					w.closingc <- ws
+					w.closingc <- ws // wgs 会一个个接受处理关闭 substream 线程
 				}()
 			case <-stopc:
 			}
@@ -954,8 +1016,13 @@ func (w *watchGRPCStream) waitCancelSubstreams(stopc <-chan struct{}) <-chan str
 	}
 	go func() {
 		defer close(donec)
+		// 外部的 stopc 会触发每个 ws 的线程结束，每个线程结束后 wg.Done 会触发 wait 唤醒
+		// wait 新来后 close(Done) 通知外部等待逻辑
+		// 所以这里相当于外部有一个 stop 手动关闭，然后外部还有一个在等待 donec
 		wg.Wait()
 	}()
+
+	// 这个 donec 是异步的，外边会等待
 	return donec
 }
 
@@ -1002,9 +1069,16 @@ func (w *watchGRPCStream) openWatchClient() (ws pb.Watch_WatchClient, err error)
 			return nil, err
 		default:
 		}
+		// 共用了 remote，因此复用了 tcp连接
+		// A[Single TCP Connection]
+		// 		B[gRPC Connection]
+		// 			B --> C[Watch Stream 1]
+		// 			B --> D[Watch Stream 2]
+		// 			B --> E[Watch Stream N]
 		if ws, err = w.remote.Watch(w.ctx, w.callOpts...); ws != nil && err == nil {
 			break
 		}
+		// 判断是否是不可恢复的错误
 		if isHaltErr(w.ctx, err) {
 			return nil, v3rpc.Error(err)
 		}
