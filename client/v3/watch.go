@@ -236,7 +236,7 @@ type watcherStream struct {
 	// recvc buffers watch responses before publishing
 	// dispatchEvent() 会给这里发送数据，通过 unicast 或者broadcast
 	recvc chan *WatchResponse
-	// donec closes when the watcherStream goroutine stops.
+	// donec closes when the watcherStream goroutine stops. serveSubStream 退出会自己close，done 是被动语态是说明自己完成
 	donec chan struct{}
 	// closing is set to true when stream should be scheduled to shutdown.
 	closing bool
@@ -280,6 +280,8 @@ func (vc *valCtx) Err() error                  { return nil }
 
 // Watch 方法会根据ctx, 初始化一个wgs 结构体
 func (w *watcher) newWatcherGRPCStream(inctx context.Context) *watchGRPCStream {
+	// 这里弄一个独立的不能取消的，是因为要跟 substream 分开，wgs需要用 cancel 取消
+	// 这个 ctx 是创建了grpc stream 的 ctx，cancel 会关闭 grpc stream
 	ctx, cancel := context.WithCancel(&valCtx{inctx})
 	wgs := &watchGRPCStream{
 		owner:      w,
@@ -315,7 +317,7 @@ func (w *watcher) Watch(ctx context.Context, key string, opts ...OpOption) Watch
 	}
 
 	wr := &watchRequest{
-		ctx:            ctx,
+		ctx:            ctx, //保存了每次watch的上下文，可以独立取消每一个 substream
 		createdNotify:  ow.createdNotify,
 		key:            string(ow.key),
 		end:            string(ow.end),
@@ -541,7 +543,7 @@ func (w *watchGRPCStream) run() {
 				closing[ws] = struct{}{}
 			}
 		}
-		w.joinSubstreams() // 等待substream 退出，done
+		w.joinSubstreams() // 等待substream 退出，等待ws.donec，也就是serveSubStream 退出
 		for range closing {
 			w.closeSubstream(<-w.closingc) // 给用户发送一个错误的 resp，清理最后的数组等逻辑数据
 		}
@@ -573,7 +575,7 @@ func (w *watchGRPCStream) run() {
 				outc := make(chan WatchResponse, 1)
 				// TODO: pass custom watch ID?
 				ws := &watcherStream{
-					initReq: *wreq,
+					initReq: *wreq, // wreq 的 ctx 跟用户传递过来的一样，因此可以取消 watcherStream
 					id:      InvalidWatchID,
 					outc:    outc,
 					// unbuffered so resumes won't cause repeat events

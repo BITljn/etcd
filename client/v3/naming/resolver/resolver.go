@@ -55,7 +55,7 @@ func (b builder) Build(target gresolver.Target, cc gresolver.ClientConn, opts gr
 	}
 
 	r.wg.Add(1)
-	go r.watch()
+	go r.watch() // 启动一个goroutine 来监听 etcd 的变更，然后更新 grpc的endpoint
 	return r, nil
 }
 
@@ -71,13 +71,14 @@ func NewBuilder(client *clientv3.Client) (gresolver.Builder, error) {
 type resolver struct {
 	c      *clientv3.Client
 	target string
-	cc     gresolver.ClientConn
+	cc     gresolver.ClientConn // 注意这个对象
 	wch    endpoints.WatchChannel
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
 
+// watch 变更然后更新 grpc的endpoint
 func (r *resolver) watch() {
 	defer r.wg.Done()
 
